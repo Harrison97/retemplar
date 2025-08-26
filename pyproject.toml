@@ -21,6 +21,7 @@ dependencies = [
   "tomlkit>=0.12.5",   # TOML parsing/editing
   "pathspec>=0.12.1",  # gitignore-style matching
   "packaging>=24.1",   # version handling
+  "pydantic>=2.5.0",  # Schema validation
 ]
 
 [dependency-groups]

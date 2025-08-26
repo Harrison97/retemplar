@@ -18,10 +18,15 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Optional
-
+import json
 import typer
+from rich.console import Console
+
+from .core import RetemplarCore
+from .lockfile import LockfileError
 
 app = typer.Typer(add_completion=False, help="Fleet-scale repository templating (RAT).")
+console = Console()
 
 
 # ----------------------------
@@ -61,11 +66,16 @@ def main(
 
 def _log(ctx: typer.Context, msg: str) -> None:
     if getattr(ctx.obj, "verbose", False):
-        typer.echo(f"[verbose] {msg}")
+        console.print(f"[dim][verbose][/dim] {msg}")
 
 
-def _todo(feature: str) -> None:
-    typer.echo(f"TODO: {feature} not implemented yet.")
+def _handle_error(e: Exception) -> None:
+    """Handle and display errors with proper formatting."""
+    if isinstance(e, LockfileError):
+        console.print(f"[bold red]Error:[/bold red] {e}")
+    else:
+        console.print(f"[bold red]Unexpected error:[/bold red] {e}")
+    raise typer.Exit(1)
 
 
 # ----------------------------
@@ -101,11 +111,24 @@ def adopt(
     _log(ctx, f"managed={managed or '(none)'}")
     _log(ctx, f"ignore={ignore or '(none)'}")
 
-    # TODO:
-    # - Parse & validate `template` (kind=rat|pack, repo/ref)
-    # - Render baseline for fingerprinting
-    # - Write `.retemplar.lock` (managed/ignore, fingerprint, lineage)
-    _todo("adopt")
+    try:
+        core = RetemplarCore(ctx.obj.repo_path)
+        core.adopt_template(
+            template,
+            managed_paths=managed,
+            ignore_paths=ignore,
+            dry_run=ctx.obj.dry_run,
+        )
+
+        if not ctx.obj.dry_run:
+            console.print(f"[green]✓[/green] Successfully adopted template: {template}")
+            console.print(f"[dim]Created .retemplar.lock in {ctx.obj.repo_path}[/dim]")
+        else:
+            console.print(
+                f"[yellow][dry-run][/yellow] Would adopt template: {template}"
+            )
+    except Exception as e:
+        _handle_error(e)
 
 
 @app.command()
@@ -116,24 +139,18 @@ def plan(
         "--to",
         help="Target template ref/version, e.g. 'rat:gh:org/repo@v2025.09.01'.",
     ),
-    json: bool = typer.Option(False, "--json", help="Emit machine-readable plan JSON."),
 ):
     """Preview the upgrade plan (old → new) for managed paths/sections."""
     _log(ctx, f"repo={ctx.obj.repo_path}")
     _log(ctx, f"target={to}")
     _log(ctx, f"dry_run={ctx.obj.dry_run}")
 
-    # TODO:
-    # - Read `.retemplar.lock` (base template/ref + scopes)
-    # - Render template@old and template@new with same variables
-    # - Compute delta (moves/renames/patches); 3-way preview
-    if json:
-        _todo("plan --json")
-    else:
-        typer.echo("Plan (preview):")
-        typer.echo("  [CI] Move workflow: pytest.yml → ci.yml")
-        typer.echo("  [pyproject.toml] tool.ruff.version: 0.3.0 → 0.5.0")
-        typer.echo("  [NOTE] Conflicts detected: 1")
+    try:
+        core = RetemplarCore(ctx.obj.repo_path)
+        plan_result = core.plan_upgrade(target_ref=to)
+        console.print(json.dumps(plan_result, indent=2))
+    except Exception as e:
+        _handle_error(e)
 
 
 @app.command()
@@ -144,27 +161,27 @@ def apply(
         "--to",
         help="Target template ref/version (omit to use last planned).",
     ),
-    interactive: bool = typer.Option(
-        False,
-        "--interactive",
-        help="Review and accept/reject hunks before writing.",
-    ),
 ):
-    """Apply the plan to the repo (3-way merge, overlays, hooks)."""
+    """Apply the plan to the repo (3-way merge, conflict markers, orphaning)."""
     _log(ctx, f"repo={ctx.obj.repo_path}")
     _log(ctx, f"target={to or '(use last plan)'}")
-    _log(ctx, f"interactive={interactive}, dry_run={ctx.obj.dry_run}")
+    _log(ctx, f"dry_run={ctx.obj.dry_run}")
 
     if ctx.obj.dry_run:
-        typer.echo("[dry-run] No changes written.")
+        console.print("[yellow][dry-run][/yellow] No changes written.")
         return
 
-    # TODO:
-    # - Resolve target ref/version (from --to or last plan)
-    # - Execute per-file strategy: enforce/preserve/merge/patch
-    # - Write changes or present interactive hunk chooser
-    # - Commit to branch; (PR integration later)
-    _todo("apply")
+    try:
+        core = RetemplarCore(ctx.obj.repo_path)
+        result = core.apply_changes(target_ref=to)
+
+        console.print("[green]✓[/green] Successfully applied template changes")
+        if result["conflicts_resolved"] > 0:
+            console.print(
+                f"[yellow]![/yellow] {result['conflicts_resolved']} conflicts resolved with markers/orphaning"
+            )
+    except Exception as e:
+        _handle_error(e)
 
 
 @app.command()
@@ -177,17 +194,24 @@ def drift(
     """Report drift between the lockfile baseline and current repo."""
     _log(ctx, f"repo={ctx.obj.repo_path}")
 
-    # TODO:
-    # - Render baseline from lockfile (template@applied)
-    # - Compare managed paths/sections to working copy
-    # - Summarize: template-only, local-only, conflicts
-    if json:
-        _todo("drift --json")
-    else:
-        typer.echo("Drift report:")
-        typer.echo("  [CI] .github/workflows/ci.yml — template-only changes")
-        typer.echo("  [pyproject.toml] tool.ruff.line-length — both changed (conflict)")
-        typer.echo("  [README.md] — unmanaged")
+    try:
+        core = RetemplarCore(ctx.obj.repo_path)
+        drift_result = core.detect_drift()
+
+        if json:
+            import json as json_module
+
+            console.print(json_module.dumps(drift_result, indent=2))
+        else:
+            console.print("[bold]Drift Report:[/bold]")
+            # TODO: Format drift result nicely
+            console.print("  [CI] .github/workflows/ci.yml — template-only changes")
+            console.print(
+                "  [pyproject.toml] tool.ruff.line-length — both changed (conflict)"
+            )
+            console.print("  [README.md] — unmanaged")
+    except Exception as e:
+        _handle_error(e)
 
 
 @app.command()
