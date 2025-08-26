@@ -1,0 +1,19 @@
+[tools]
+python = "3.12"
+uv = "latest"
+
+[env]
+# Set Python path for development
+PYTHONPATH = "src"
+
+[tasks.install]
+description = "Install core dependencies"
+run = "uv sync --all-groups"
+
+[tasks.test]
+description = "Run tests"
+run = "uv run pytest"
+
+[tasks.format]
+description = "Run tests"
+run = "uvx tbelt format python"
