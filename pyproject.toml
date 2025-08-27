@@ -37,3 +37,6 @@ retemplar = "retemplar.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/retemplar"]
+
+[tool.toolbelt]
+include= ['@toolbelt:resources/presets/python-hdw.yaml']

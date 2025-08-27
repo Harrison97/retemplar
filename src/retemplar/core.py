@@ -1,67 +1,65 @@
 """
 Core retemplar operations (MVP).
 
-Simple orchestration of lockfile operations for RAT adoption and basic operations.
+Surgical refactor: simplified, readable, ready for 3-way merge + baseline.
 """
 
-import shutil
-import difflib
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
+import logging
 
 from .lockfile import LockfileManager, LockfileNotFoundError
+from .blockprotect import enforce_ours_blocks, find_ignore_blocks
+
+from . import utils
+
+
+# Better type safety with fallback imports
+try:
+    from .schema import RenderRule
+except ImportError:
+    RenderRule = Dict[str, Any]  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PlanItem:
+    path: str
+    strategy: str  # "enforce" | "preserve" | "merge"
+    kind: str  # "create" | "overwrite" | "edit" | "delete" | "keep"
+    note: str = ""
+    had_conflict: bool = False
 
 
 class RetemplarCore:
-    """Core orchestrator for retemplar operations."""
+    """Core orchestrator for retemplar operations (refactored MVP)."""
 
     def __init__(self, repo_path: Path):
-        """Initialize with repository root path."""
         self.repo_path = Path(repo_path).resolve()
         self.lockfile_manager = LockfileManager(self.repo_path)
 
-    def _resolve_template_path(self, template_repo: str) -> Path:
-        """Resolve template repo string to filesystem path."""
-        if template_repo.startswith("local:"):
-            # Handle local:path format
-            local_path = template_repo[6:]  # Remove "local:" prefix
-            return Path(local_path).resolve()
-        elif template_repo.startswith(("gh:", "github:")):
-            # TODO: Clone/fetch GitHub repo for real implementation
-            raise NotImplementedError("GitHub repos not supported yet in MVP")
-        else:
-            raise ValueError(f"Unsupported repo format: {template_repo}")
-
-    def _get_template_files(self, template_path: Path) -> Dict[str, Path]:
-        """Get all files in template directory."""
-        files = {}
-        if not template_path.exists():
-            raise ValueError(f"Template path does not exist: {template_path}")
-
-        for file_path in template_path.rglob("*"):
-            if file_path.is_file():
-                # Store relative path as key
-                rel_path = file_path.relative_to(template_path)
-                files[str(rel_path)] = file_path
-
-        return files
+    # ----- Public ops -----
 
     def adopt_template(
         self,
         template_ref: str,
         managed_paths: Optional[List[str]] = None,
         ignore_paths: Optional[List[str]] = None,
+        render_rules: Optional[List[Dict[str, str]]] = None,
         dry_run: bool = False,
     ) -> Dict[str, Any]:
-        """Adopt a RAT template and create .retemplar.lock file."""
-
+        """Create initial .retemplar.lock (no baseline yet)."""
         if self.lockfile_manager.exists():
-            raise ValueError("Repository already has .retemplar.lock file")
+            raise ValueError("Repository already has .retemplar.lock")
 
         lock = self.lockfile_manager.create_adoption_lock(
             template_ref=template_ref,
             managed_paths=managed_paths,
             ignore_paths=ignore_paths,
+            render_rules=render_rules,
         )
 
         if not dry_run:
@@ -71,438 +69,369 @@ class RetemplarCore:
             "template": template_ref,
             "managed_paths": managed_paths or [],
             "ignore_paths": ignore_paths or [],
+            "render_rules": render_rules or [],
             "lockfile_created": not dry_run,
         }
 
     def plan_upgrade(self, target_ref: str) -> Dict[str, Any]:
-        """Plan upgrade to new RAT version."""
-
+        """Compute a human-readable plan. 2-way semantics for now."""
         if not self.lockfile_manager.exists():
             raise LockfileNotFoundError(
-                "No .retemplar.lock found. Run 'retemplar adopt' first."
+                "No .retemplar.lock found. Run 'retemplar adopt' first.",
             )
 
-        current_lock = self.lockfile_manager.read()
+        lock = self.lockfile_manager.read()
+        target_src = self.lockfile_manager._parse_template_ref(target_ref)  # type: ignore[attr-defined]
+        tpl_root = utils.resolve_template_path(target_src.repo)
 
-        # Parse target template reference
-        target_source = self.lockfile_manager._parse_template_ref(target_ref)
+        # Template file set (relative posix)
+        tpl_files = set(utils.list_files(tpl_root))
+        # Repo file set
+        repo_files = set(utils.list_files(self.repo_path))
 
-        # Get current and target template files
-        current_template_path = self._resolve_template_path(current_lock.template.repo)
-        target_template_path = self._resolve_template_path(target_source.repo)
+        # Union for consideration
+        candidate_files = sorted(tpl_files | repo_files)
 
-        current_files = self._get_template_files(current_template_path)
-        target_files = self._get_template_files(target_template_path)
-
-        # Plan changes based on managed paths with proper precedence
-        changes = []
+        items: List[PlanItem] = []
         conflicts = 0
-        processed_files = set()
 
-        # Handle files that exist in new template (additions/modifications)
-        for file_rel_path in target_files:
-            # Check if file should be ignored (highest precedence)
-            if self._is_ignored(file_rel_path, current_lock.ignore_paths):
+        for rel in candidate_files:
+            if utils.is_ignored(rel, getattr(lock, "ignore_paths", []) or []):
                 continue
-
-            # Find the most specific matching managed path rule
-            matching_rule = self._find_best_matching_rule(
-                file_rel_path, current_lock.managed_paths
+            rule = utils.best_rule(
+                rel,
+                getattr(lock, "managed_paths", []) or [],
             )
-
-            if not matching_rule:
-                # File not managed, skip it
+            if not rule:
                 continue
 
-            if file_rel_path in processed_files:
+            strategy = getattr(rule, "strategy", "merge")
+            in_tpl = rel in tpl_files
+            in_repo = rel in repo_files
+
+            if strategy == "preserve":
+                if in_tpl and not in_repo:
+                    items.append(
+                        PlanItem(
+                            rel,
+                            strategy,
+                            "create",
+                            "template will create (preserve local thereafter)",
+                        ),
+                    )
+                else:
+                    items.append(
+                        PlanItem(
+                            rel,
+                            strategy,
+                            "keep",
+                            "preserve local content",
+                        ),
+                    )
                 continue
-            processed_files.add(file_rel_path)
-
-            repo_file = self.repo_path / file_rel_path
-            strategy = matching_rule.strategy
-
-            change = {
-                "file": file_rel_path,
-                "strategy": strategy,
-                "type": "unknown",
-                "matched_rule": matching_rule.path,
-            }
 
             if strategy == "enforce":
-                if repo_file.exists():
-                    change["type"] = "overwrite"
-                    change["description"] = (
-                        f"Template will overwrite local file (rule: {matching_rule.path})"
+                if in_tpl and in_repo:
+                    items.append(
+                        PlanItem(
+                            rel,
+                            strategy,
+                            "overwrite",
+                            "template will overwrite local file",
+                        ),
                     )
-                else:
-                    change["type"] = "create"
-                    change["description"] = (
-                        f"Template will create new file (rule: {matching_rule.path})"
+                elif in_tpl and not in_repo:
+                    items.append(
+                        PlanItem(
+                            rel,
+                            strategy,
+                            "create",
+                            "template will create file",
+                        ),
                     )
+                elif not in_tpl and in_repo:
+                    items.append(
+                        PlanItem(
+                            rel,
+                            strategy,
+                            "delete",
+                            "template removed file; will delete locally",
+                        ),
+                    )
+                continue
 
-            elif strategy == "preserve":
-                if repo_file.exists():
-                    change["type"] = "skip"
-                    change["description"] = (
-                        f"Local file preserved, template ignored (rule: {matching_rule.path})"
-                    )
+            # strategy == "merge"
+            if in_tpl and in_repo:  # Plan for actual file diffs
+                ours = utils.read_text(self.repo_path / rel)
+                theirs = utils.apply_render_rules_text(
+                    utils.read_text(tpl_root / rel) or "",
+                    getattr(lock, "render_rules", None),
+                )
+                if ours is None or theirs is None:
+                    had_conflict = True  # binary/unreadable
                 else:
-                    change["type"] = "create"
-                    change["description"] = (
-                        f"Template will create new file, no conflict (rule: {matching_rule.path})"
-                    )
-
-            elif strategy == "merge":
-                if repo_file.exists():
-                    change["type"] = "conflict"
-                    change["description"] = (
-                        f"Manual merge required (rule: {matching_rule.path})"
-                    )
+                    had_conflict = ours != theirs
+                items.append(
+                    PlanItem(
+                        rel,
+                        strategy,
+                        "edit",
+                        "merge changes",
+                        had_conflict=had_conflict,
+                    ),
+                )
+                if had_conflict:
                     conflicts += 1
-                else:
-                    change["type"] = "create"
-                    change["description"] = (
-                        f"Template will create new file (rule: {matching_rule.path})"
-                    )
+            elif in_tpl and not in_repo:
+                items.append(
+                    PlanItem(
+                        rel,
+                        strategy,
+                        "create",
+                        "template adds file; adopt it",
+                    ),
+                )
+            elif not in_tpl and in_repo:
+                items.append(
+                    PlanItem(
+                        rel,
+                        strategy,
+                        "delete",
+                        "template removed file; will delete",
+                    ),
+                )
 
-            changes.append(change)
-
-        # Handle files that are managed but no longer exist in template (deletions)
-        # Check all managed paths to see if their files are missing from the new template
-        for managed_path in current_lock.managed_paths:
-            # Find all files that match this managed path pattern
-            repo_files_matching_pattern = []
-
-            # Check all files in repo directory that match the pattern
-            for repo_file in self.repo_path.rglob("*"):
-                if repo_file.is_file():
-                    rel_path = repo_file.relative_to(self.repo_path)
-                    if self._matches_pattern(str(rel_path), managed_path.path):
-                        repo_files_matching_pattern.append(str(rel_path))
-
-            # For each file matching the pattern, check if it's missing from template
-            for file_rel_path in repo_files_matching_pattern:
-                # Skip if file still exists in new template (already handled above)
-                if file_rel_path in target_files:
-                    continue
-
-                # Skip if file should be ignored
-                if self._is_ignored(file_rel_path, current_lock.ignore_paths):
-                    continue
-
-                if file_rel_path in processed_files:
-                    continue
-                processed_files.add(file_rel_path)
-
-                repo_file = self.repo_path / file_rel_path
-                if not repo_file.exists():
-                    # File doesn't exist in repo anyway, no action needed
-                    continue
-
-                strategy = managed_path.strategy
-
-                change = {
-                    "file": file_rel_path,
-                    "strategy": strategy,
-                    "type": "unknown",
-                    "matched_rule": managed_path.path,
-                }
-
-                if strategy == "enforce":
-                    change["type"] = "delete"
-                    change["description"] = (
-                        f"File no longer in template, will delete locally (rule: {managed_path.path})"
-                    )
-
-                elif strategy == "preserve":
-                    change["type"] = "keep"
-                    change["description"] = (
-                        f"File no longer in template, but preserved locally (rule: {managed_path.path})"
-                    )
-
-                elif strategy == "merge":
-                    # Check if file was modified since last apply (simplified: always consider it modified for MVP)
-                    if self._file_was_modified_locally(repo_file, current_lock):
-                        change["type"] = "orphan"
-                        change["description"] = (
-                            f"File no longer in template, but locally modified - marked as orphaned (rule: {managed_path.path})"
-                        )
-                        conflicts += 1
-                    else:
-                        change["type"] = "delete"
-                        change["description"] = (
-                            f"File no longer in template, no local changes - will delete (rule: {managed_path.path})"
-                        )
-
-                changes.append(change)
+        # Plan block-protection preview (consumer-side markers)
+        block_events = self._scan_block_protection(
+            getattr(lock, "managed_paths", []) or [],
+        )
 
         return {
-            "current_version": current_lock.version,
+            "current_version": getattr(lock, "version", None),
             "target_version": target_ref,
-            "changes": changes,
+            "changes": [
+                {
+                    "file": item.path,
+                    "strategy": item.strategy,
+                    "type": item.kind,
+                    "note": item.note,
+                    "had_conflict": item.had_conflict,
+                    "matched_rule": utils.best_rule(
+                        item.path,
+                        getattr(lock, "managed_paths", []) or [],
+                    ).path,
+                }
+                for item in items
+            ],
             "conflicts": conflicts,
+            "block_protection": block_events,
         }
 
-    def _matches_pattern(self, file_path: str, pattern: str) -> bool:
-        """Simple pattern matching for MVP."""
-        if pattern.endswith("/**"):
-            # Directory glob like "src/**"
-            dir_prefix = pattern[:-3]  # Remove "/**"
-            return file_path.startswith(dir_prefix + "/") or file_path == dir_prefix
-        elif "*" in pattern:
-            # Simple wildcard (not implemented yet)
-            return False
-        else:
-            # Exact match
-            return file_path == pattern
-
-    def _is_ignored(self, file_path: str, ignore_patterns: List[str]) -> bool:
-        """Check if file should be ignored."""
-        for pattern in ignore_patterns:
-            if self._matches_pattern(file_path, pattern):
-                return True
-        return False
-
-    def _find_best_matching_rule(self, file_path: str, managed_paths):
-        """Find the most specific rule that matches this file."""
-        matching_rules = []
-
-        for managed_path in managed_paths:
-            if self._matches_pattern(file_path, managed_path.path):
-                matching_rules.append(managed_path)
-
-        if not matching_rules:
-            return None
-
-        # Return the most specific rule (exact matches beat globs)
-        # Sort by specificity: exact matches first, then by length (more specific paths)
-        def rule_specificity(rule):
-            path = rule.path
-            if "/**" in path:
-                return (1, len(path))  # Directory glob
-            elif "*" in path:
-                return (2, len(path))  # Other glob
-            else:
-                return (0, len(path))  # Exact match (highest priority)
-
-        return sorted(matching_rules, key=rule_specificity)[0]
-
-    def _file_was_modified_locally(self, repo_file: Path, current_lock) -> bool:
-        """Check if file was modified since last apply (simplified for MVP)."""
-        # TODO: For full implementation, compare against baseline from applied_ref
-        # For MVP, assume all existing files were modified (conservative approach)
-        return repo_file.exists()
-
-    def apply_changes(self, target_ref: Optional[str] = None) -> Dict[str, Any]:
-        """Apply planned changes."""
-
+    def apply_changes(
+        self,
+        target_ref: str,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Apply the plan (non-interactive). 2-way for now; conflict markers on merge."""
         if not self.lockfile_manager.exists():
             raise LockfileNotFoundError(
-                "No .retemplar.lock found. Run 'retemplar adopt' first."
+                "No .retemplar.lock found. Run 'retemplar adopt' first.",
             )
-
         if not target_ref:
             raise ValueError("target_ref is required for apply")
 
-        # Get the plan first
         plan = self.plan_upgrade(target_ref)
-
-        # All conflicts are now auto-resolvable:
-        # - merge conflicts get conflict markers
-        # - orphan conflicts get .orphaned suffix
-        # No interactive mode needed
-
-        # Parse target template reference
-        target_source = self.lockfile_manager._parse_template_ref(target_ref)
-        target_template_path = self._resolve_template_path(target_source.repo)
-
-        # Read current lock for baseline access
-        current_lock = self.lockfile_manager.read()
+        lock = self.lockfile_manager.read()
+        target_src = self.lockfile_manager._parse_template_ref(target_ref)  # type: ignore[attr-defined]
+        tpl_root = utils.resolve_template_path(target_src.repo)
 
         files_changed = 0
-        conflicts_resolved = 0
+        conflicts = 0
 
-        # Apply each change (ignore paths are already filtered out in plan)
         for change in plan["changes"]:
-            file_path = change["file"]
-            strategy = change["strategy"]
-            change_type = change["type"]
+            rel = change["file"]
+            strat = change["strategy"]
+            kind = change["type"]
 
-            repo_file_path = self.repo_path / file_path
-            template_file_path = target_template_path / file_path
+            repo_p = self.repo_path / rel
+            tpl_p = tpl_root / rel
 
-            if strategy == "enforce":
-                if change_type in ("create", "overwrite"):
-                    # Copy from template to repo
-                    self._copy_file(template_file_path, repo_file_path)
+            if strat == "preserve":
+                if kind == "create" and not repo_p.exists():
+                    if not dry_run:
+                        utils.copy_with_render_and_blockprotect(
+                            tpl_p,
+                            repo_p,
+                            getattr(lock, "render_rules", None),
+                            self.repo_path,
+                        )
                     files_changed += 1
-                elif change_type == "delete":
-                    # Template deleted file, enforce means delete locally too
-                    self._delete_file(repo_file_path)
+                continue
+
+            if strat == "enforce":
+                if kind in ("create", "overwrite"):
+                    if not dry_run:
+                        utils.copy_with_render_and_blockprotect(
+                            tpl_p,
+                            repo_p,
+                            getattr(lock, "render_rules", None),
+                            self.repo_path,
+                        )
                     files_changed += 1
-
-            elif strategy == "preserve":
-                if change_type == "create":
-                    # Only create if file doesn't exist locally
-                    self._copy_file(template_file_path, repo_file_path)
+                elif kind == "delete":
+                    if not dry_run:
+                        utils.delete_file(repo_p)
                     files_changed += 1
-                # Skip existing files (preserve local changes)
-                # For "keep" type (template deleted but we preserve), do nothing
+                continue
 
-            elif strategy == "merge":
-                if change_type == "conflict":
-                    # Perform 3-way merge
-                    local_content = repo_file_path.read_text(encoding="utf-8")
-                    remote_content = template_file_path.read_text(encoding="utf-8")
-                    baseline_content = self._get_baseline_content()
-
-                    merged_content, has_conflicts = self._three_way_merge(
-                        baseline_content, local_content, remote_content
+            # merge
+            if kind == "create":
+                if not dry_run:
+                    utils.copy_with_render_and_blockprotect(
+                        tpl_p,
+                        repo_p,
+                        getattr(lock, "render_rules", None),
+                        self.repo_path,
                     )
+                files_changed += 1
+                continue
 
-                    # Write the merged content (with conflict markers if needed)
-                    repo_file_path.write_text(merged_content, encoding="utf-8")
-                    files_changed += 1
+            if kind == "delete":
+                if not dry_run:
+                    utils.delete_file(repo_p)
+                files_changed += 1
+                continue
 
-                    if has_conflicts:
-                        conflicts_resolved += 1
+            if kind == "edit":
+                ours = utils.read_text(repo_p)
+                theirs = utils.read_text(tpl_p)
+                if ours is None or theirs is None:
+                    # binary or unreadable → keep local, flag conflict
+                    print(
+                        f"[WARN] binary merge unsupported: {rel} (kept local)",
+                    )
+                    conflicts += 1
+                    # do not overwrite; user can switch strategy to 'enforce' if desired
+                    continue
 
-                elif change_type == "create":
-                    self._copy_file(template_file_path, repo_file_path)
-                    files_changed += 1
-                elif change_type == "delete":
-                    # Template deleted file, no local changes, safe to delete
-                    self._delete_file(repo_file_path)
-                    files_changed += 1
-                elif change_type == "orphan":
-                    # Always orphan the file (mark with .orphaned suffix)
-                    # In interactive mode, could ask user for different behavior
-                    self._mark_orphaned(repo_file_path)
-                    conflicts_resolved += 1
+                theirs = utils.apply_render_rules_text(
+                    theirs,
+                    getattr(lock, "render_rules", None),
+                )
+                if ours == theirs:
+                    # No change → skip writing, no conflict
+                    continue
 
-        # Update lockfile with new applied version
-        current_lock = self.lockfile_manager.read()
-        updated_lock = current_lock.model_copy(
-            update={
-                "applied_ref": target_source.ref,
-                "applied_commit": target_source.commit,
-            }
-        )
-        self.lockfile_manager.write(updated_lock)
+                # 2-way conflict markers (MVP)
+                merged = utils.merge_with_conflicts(ours, theirs)
+                # post-merge: enforce consumer-side ignore blocks
+                final, _report = enforce_ours_blocks(ours, merged)
+                if not dry_run:
+                    utils.write_text(repo_p, final)
+                conflicts += 1
+                files_changed += 1
+                continue
+
+        # Best-effort lockfile update
+        try:
+            lock = self.lockfile_manager.read()
+
+            # bring template source forward to the target
+            new_template = lock.template.model_copy(
+                update={
+                    "repo": getattr(target_src, "repo", lock.template.repo),
+                    "ref": getattr(target_src, "ref", lock.template.ref),
+                    "commit": getattr(
+                        target_src,
+                        "commit",
+                        lock.template.commit,
+                    ),
+                },
+            )
+
+            # recompute the human-readable version string
+            new_version = f"{new_template.kind}@{new_template.ref}"
+
+            updated = lock.model_copy(
+                update={
+                    "template": new_template,
+                    "applied_ref": new_template.ref,
+                    "applied_commit": new_template.commit,
+                    "version": new_version,
+                    # optionally set these if/when you wire them:
+                    # "consumer_commit": current_repo_head_sha_or_none,
+                    # "baseline_ref": None,  # for 2-way MVP leave unset
+                },
+            )
+
+            self.lockfile_manager.write(updated)
+
+        except Exception:
+            # non-fatal: keep changes on disk even if lock update fails
+            pass
 
         return {
             "applied_version": target_ref,
             "files_changed": files_changed,
-            "conflicts_resolved": conflicts_resolved,
+            "conflicts_resolved": conflicts,
         }
 
-    def _copy_file(self, src: Path, dst: Path) -> None:
-        """Copy file from src to dst, creating parent directories if needed."""
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-
-    def _delete_file(self, file_path: Path) -> None:
-        """Delete file if it exists."""
-        if file_path.exists():
-            file_path.unlink()
-            # Clean up empty parent directories
-            try:
-                file_path.parent.rmdir()
-            except OSError:
-                # Directory not empty or other error, ignore
-                pass
-
-    def _mark_orphaned(self, file_path: Path) -> None:
-        """Mark file as orphaned by renaming with .orphaned suffix."""
-        if file_path.exists():
-            orphaned_path = file_path.with_suffix(file_path.suffix + ".orphaned")
-            file_path.rename(orphaned_path)
-
-    def _three_way_merge(
-        self, base_content: str, local_content: str, remote_content: str
-    ) -> Tuple[str, bool]:
-        """
-        Perform 3-way merge like git.
-
-        Args:
-            base_content: Content from baseline (applied_ref)
-            local_content: Current content in repo
-            remote_content: Content from new template
-
-        Returns:
-            (merged_content, has_conflicts)
-        """
-        base_lines = base_content.splitlines(keepends=True)
-        local_lines = local_content.splitlines(keepends=True)
-        remote_lines = remote_content.splitlines(keepends=True)
-
-        # Use difflib to create a 3-way merge
-        # This is a simplified version - real git merge is more complex
-
-        # Get diffs from base to local and base to remote
-        local_diff = list(difflib.unified_diff(base_lines, local_lines, n=0))
-        remote_diff = list(difflib.unified_diff(base_lines, remote_lines, n=0))
-
-        # If one side is unchanged, use the other side
-        if not local_diff or local_diff == []:  # No local changes
-            return remote_content, False
-        if not remote_diff or remote_diff == []:  # No remote changes
-            return local_content, False
-
-        # Both sides changed - attempt automatic merge or create conflict markers
-        return self._merge_with_conflicts(local_content, remote_content)
-
-    def _merge_with_conflicts(
-        self, local_content: str, remote_content: str
-    ) -> Tuple[str, bool]:
-        """Create merge with conflict markers when automatic merge fails."""
-
-        # For MVP, create simple conflict markers for the entire file
-        # A more sophisticated implementation would do line-by-line or hunk-by-hunk merging
-
-        merged_lines = [
-            "<<<<<<< LOCAL (current)\n",
-            local_content,
-            "=======\n",
-            remote_content,
-            ">>>>>>> REMOTE (template)\n",
-        ]
-
-        # Ensure newlines are handled correctly
-        if not local_content.endswith("\n"):
-            merged_lines[1] += "\n"
-        if not remote_content.endswith("\n"):
-            merged_lines[3] += "\n"
-
-        return "".join(merged_lines), True
-
-    def _get_baseline_content(self) -> str:
-        """Get the baseline content for 3-way merge (simplified for MVP)."""
-
-        # TODO: For full implementation, this would:
-        # 1. Checkout the applied_ref from git
-        # 2. Or read from a stored baseline snapshot
-        # 3. Or reconstruct from the lockfile fingerprint
-
-        # For MVP: assume the baseline is empty (file didn't exist before)
-        # This makes it a 2-way merge in practice
-        return ""
-
     def detect_drift(self) -> Dict[str, Any]:
-        """Detect drift from applied baseline (placeholder)."""
+        """Detect drift between repo and baseline (placeholder for 3-way)."""
 
         if not self.lockfile_manager.exists():
             raise LockfileNotFoundError(
-                "No .retemplar.lock found. Run 'retemplar adopt' first."
+                "No .retemplar.lock found. Run 'retemplar adopt' first.",
             )
 
         current_lock = self.lockfile_manager.read()
 
-        # TODO: Real implementation will compare against applied_ref baseline
+        # TODO: Real implementation needs:
+        # - Baseline resolution from applied_ref
+        # - 3-way comparison: Base vs Ours vs Theirs
+        # - Categorization of changes (template-only, local-only, conflicts)
+
         return {
             "baseline_version": current_lock.applied_ref or current_lock.template.ref,
-            "template_only_changes": [],
-            "local_only_changes": [],
-            "conflicts": [],
-            "unmanaged_files": [],
+            "template_only_changes": [],  # TODO: implement with baseline
+            "local_only_changes": [],  # TODO: implement with baseline
+            "conflicts": [],  # TODO: implement with baseline
+            "unmanaged_files": [],  # TODO: implement
         }
+
+    def _scan_block_protection(
+        self,
+        managed_rules: List[Any],
+    ) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        ignore_patterns = (
+            getattr(self.lockfile_manager.read(), "ignore_paths", [])
+            if self.lockfile_manager.exists()
+            else []
+        )
+        for rel in sorted(set(utils.list_files(self.repo_path))):
+            if any(utils.match(rel, pat) for pat in ignore_patterns):
+                continue
+            rule = utils.best_rule(rel, managed_rules)
+            if not rule:
+                continue
+            p = self.repo_path / rel
+            s = utils.read_text(p)
+            if s is None:
+                continue
+            blocks = find_ignore_blocks(s)
+            if blocks:
+                events.append(
+                    {
+                        "file": rel,
+                        "blocks": [
+                            {
+                                "id": bid,
+                                "start": span.start + 1,
+                                "end": span.end + 1,
+                            }
+                            for bid, span in blocks.items()
+                        ],
+                    },
+                )
+        return events

@@ -7,9 +7,7 @@ from pathlib import Path
 from retemplar.lockfile import (
     LockfileManager,
     LockfileNotFoundError,
-    LockfileValidationError,
 )
-from retemplar.schema import RetemplarLock, TemplateSource
 
 
 @pytest.fixture
@@ -57,10 +55,10 @@ def test_create_adoption_lock_local():
     """Test creating adoption lockfile for local RAT template."""
     manager = LockfileManager(Path("/tmp"))
 
-    lock = manager.create_adoption_lock("rat:local:/path/to/template@main")
+    lock = manager.create_adoption_lock("rat:/path/to/template@main")
 
     assert lock.template.kind == "rat"
-    assert lock.template.repo == "local:/path/to/template"
+    assert lock.template.repo == "/path/to/template"
     assert lock.template.ref == "main"
     assert lock.version == "rat@main"
 

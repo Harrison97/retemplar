@@ -1,6 +1,7 @@
 """Tests for lockfile schema validation (MVP)."""
 
 import pytest
+from pydantic import ValidationError
 
 from retemplar.schema import RetemplarLock, TemplateSource, ManagedPath
 
@@ -16,7 +17,8 @@ def test_rat_template_source():
 def test_template_source_invalid_repo():
     """Test template source with invalid repo format."""
     with pytest.raises(
-        ValueError, match="repo must start with 'gh:', 'github:', or 'local:'"
+        ValidationError,
+        match="repo must start with 'gh:', './', '/', or a dotted local path containing '/'",
     ):
         TemplateSource(repo="invalid:format", ref="v1.0.0")
 
@@ -35,7 +37,9 @@ def test_complete_lockfile():
     managed_path = ManagedPath(path=".github/workflows/**", strategy="enforce")
 
     lock = RetemplarLock(
-        template=template, version="rat@v2025.08.01", managed_paths=[managed_path]
+        template=template,
+        version="rat@v2025.08.01",
+        managed_paths=[managed_path],
     )
 
     assert lock.schema_version == "0.1.0"
