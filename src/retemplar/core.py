@@ -1,7 +1,5 @@
 """
 Core retemplar operations (MVP).
-
-Surgical refactor: simplified, readable, ready for 3-way merge + baseline.
 """
 
 from dataclasses import dataclass
@@ -11,16 +9,10 @@ from typing import Any, Dict, List, Optional
 import logging
 
 from .lockfile import LockfileManager, LockfileNotFoundError
-from .blockprotect import enforce_ours_blocks, find_ignore_blocks
+from .utils.blockprotect import enforce_ours_blocks, find_ignore_blocks
 
-from . import utils
-
-
-# Better type safety with fallback imports
-try:
-    from .schema import RenderRule
-except ImportError:
-    RenderRule = Dict[str, Any]  # type: ignore
+from .utils import fs_utils
+from .utils import merge_utils
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +74,12 @@ class RetemplarCore:
 
         lock = self.lockfile_manager.read()
         target_src = self.lockfile_manager._parse_template_ref(target_ref)  # type: ignore[attr-defined]
-        tpl_root = utils.resolve_template_path(target_src.repo)
+        tpl_root = fs_utils.resolve_template_path(target_src.repo)
 
         # Template file set (relative posix)
-        tpl_files = set(utils.list_files(tpl_root))
+        tpl_files = set(fs_utils.list_files(tpl_root))
         # Repo file set
-        repo_files = set(utils.list_files(self.repo_path))
+        repo_files = set(fs_utils.list_files(self.repo_path))
 
         # Union for consideration
         candidate_files = sorted(tpl_files | repo_files)
@@ -96,9 +88,12 @@ class RetemplarCore:
         conflicts = 0
 
         for rel in candidate_files:
-            if utils.is_ignored(rel, getattr(lock, "ignore_paths", []) or []):
+            if fs_utils.is_ignored(
+                rel,
+                getattr(lock, "ignore_paths", []) or [],
+            ):
                 continue
-            rule = utils.best_rule(
+            rule = fs_utils.best_rule(
                 rel,
                 getattr(lock, "managed_paths", []) or [],
             )
@@ -162,9 +157,9 @@ class RetemplarCore:
 
             # strategy == "merge"
             if in_tpl and in_repo:  # Plan for actual file diffs
-                ours = utils.read_text(self.repo_path / rel)
-                theirs = utils.apply_render_rules_text(
-                    utils.read_text(tpl_root / rel) or "",
+                ours = fs_utils.read_text(self.repo_path / rel)
+                theirs = fs_utils.apply_render_rules_text(
+                    fs_utils.read_text(tpl_root / rel) or "",
                     getattr(lock, "render_rules", None),
                 )
                 if ours is None or theirs is None:
@@ -216,7 +211,7 @@ class RetemplarCore:
                     "type": item.kind,
                     "note": item.note,
                     "had_conflict": item.had_conflict,
-                    "matched_rule": utils.best_rule(
+                    "matched_rule": fs_utils.best_rule(
                         item.path,
                         getattr(lock, "managed_paths", []) or [],
                     ).path,
@@ -243,7 +238,7 @@ class RetemplarCore:
         plan = self.plan_upgrade(target_ref)
         lock = self.lockfile_manager.read()
         target_src = self.lockfile_manager._parse_template_ref(target_ref)  # type: ignore[attr-defined]
-        tpl_root = utils.resolve_template_path(target_src.repo)
+        tpl_root = fs_utils.resolve_template_path(target_src.repo)
 
         files_changed = 0
         conflicts = 0
@@ -259,7 +254,7 @@ class RetemplarCore:
             if strat == "preserve":
                 if kind == "create" and not repo_p.exists():
                     if not dry_run:
-                        utils.copy_with_render_and_blockprotect(
+                        merge_utils.copy_with_render_and_blockprotect(
                             tpl_p,
                             repo_p,
                             getattr(lock, "render_rules", None),
@@ -271,7 +266,7 @@ class RetemplarCore:
             if strat == "enforce":
                 if kind in ("create", "overwrite"):
                     if not dry_run:
-                        utils.copy_with_render_and_blockprotect(
+                        merge_utils.copy_with_render_and_blockprotect(
                             tpl_p,
                             repo_p,
                             getattr(lock, "render_rules", None),
@@ -280,14 +275,14 @@ class RetemplarCore:
                     files_changed += 1
                 elif kind == "delete":
                     if not dry_run:
-                        utils.delete_file(repo_p)
+                        fs_utils.delete_file(repo_p)
                     files_changed += 1
                 continue
 
             # merge
             if kind == "create":
                 if not dry_run:
-                    utils.copy_with_render_and_blockprotect(
+                    merge_utils.copy_with_render_and_blockprotect(
                         tpl_p,
                         repo_p,
                         getattr(lock, "render_rules", None),
@@ -298,13 +293,13 @@ class RetemplarCore:
 
             if kind == "delete":
                 if not dry_run:
-                    utils.delete_file(repo_p)
+                    fs_utils.delete_file(repo_p)
                 files_changed += 1
                 continue
 
             if kind == "edit":
-                ours = utils.read_text(repo_p)
-                theirs = utils.read_text(tpl_p)
+                ours = fs_utils.read_text(repo_p)
+                theirs = fs_utils.read_text(tpl_p)
                 if ours is None or theirs is None:
                     # binary or unreadable → keep local, flag conflict
                     print(
@@ -314,7 +309,7 @@ class RetemplarCore:
                     # do not overwrite; user can switch strategy to 'enforce' if desired
                     continue
 
-                theirs = utils.apply_render_rules_text(
+                theirs = fs_utils.apply_render_rules_text(
                     theirs,
                     getattr(lock, "render_rules", None),
                 )
@@ -323,11 +318,11 @@ class RetemplarCore:
                     continue
 
                 # 2-way conflict markers (MVP)
-                merged = utils.merge_with_conflicts(ours, theirs)
+                merged = merge_utils.merge_with_conflicts(ours, theirs)
                 # post-merge: enforce consumer-side ignore blocks
                 final, _report = enforce_ours_blocks(ours, merged)
                 if not dry_run:
-                    utils.write_text(repo_p, final)
+                    fs_utils.write_text(repo_p, final)
                 conflicts += 1
                 files_changed += 1
                 continue
@@ -409,14 +404,14 @@ class RetemplarCore:
             if self.lockfile_manager.exists()
             else []
         )
-        for rel in sorted(set(utils.list_files(self.repo_path))):
-            if any(utils.match(rel, pat) for pat in ignore_patterns):
+        for rel in sorted(set(fs_utils.list_files(self.repo_path))):
+            if any(fs_utils.match(rel, pat) for pat in ignore_patterns):
                 continue
-            rule = utils.best_rule(rel, managed_rules)
+            rule = fs_utils.best_rule(rel, managed_rules)
             if not rule:
                 continue
             p = self.repo_path / rel
-            s = utils.read_text(p)
+            s = fs_utils.read_text(p)
             if s is None:
                 continue
             blocks = find_ignore_blocks(s)

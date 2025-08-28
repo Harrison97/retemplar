@@ -1,6 +1,6 @@
 """Essential tests for block protection functionality."""
 
-from retemplar.blockprotect import (
+from retemplar.utils.blockprotect import (
     find_ignore_blocks,
     enforce_ours_blocks,
 )

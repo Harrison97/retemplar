@@ -230,6 +230,7 @@ def drift(
     ),
 ):
     """Report drift between the lockfile baseline and current repo (stub)."""
+    console.print("Drift detection is a work in progress.", style="white on red")
     try:
         core = RetemplarCore(ctx.obj.repo_path)
         drift_result = core.detect_drift()

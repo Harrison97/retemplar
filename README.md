@@ -1,6 +1,6 @@
 # retemplar
 
-> Fleet-scale repo templating and structural lifecycle management.
+> Keep many repos in sync with a living template — without trampling local changes.
 
 ## Purpose
 
@@ -22,18 +22,30 @@ The result: consistent, auditable upgrades across your entire fleet of repos.
 
 ## Development Workflow
 
+### Inline blocks:
+Example:
+```
+# retemplar:begin id=<ID?> mode=ignore|protect
+...your local content...
+# retemplar:end
+```
+- Ignore will keep your code untouched
+- Protect will create a diff of your code and the template for review
+
+### CLI
 ```bash
-# Install dependencies (planned)
-poetry install
+pip install retemplar
 
-# See available commands
-retemplar --help
 
-# Adopt a repo into RAT mode
-retemplar adopt --template rat:gh:org/main@v2025.08.01
+# adopt repo to a template
+retemplar adopt --template rat:../TEMPLATE
 
-# Plan upgrade to new template ref
-retemplar plan --to rat:gh:org/main@v2025.09.01
+# NOTE: You will need to configure the lockfile yourself now
 
-# Apply and open a PR
-retemplar apply --open-pr
+# preview changes
+retemplar plan --to rat:../TEMPLATE
+
+
+# apply
+retemplar apply --to rat:../TEMPLATE
+```

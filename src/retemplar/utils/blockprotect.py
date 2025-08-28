@@ -49,7 +49,7 @@ class BlockReport:
 COMMENT_LEADER = r"(?:#|//|;|--)?"
 
 BEGIN_PATTERN = re.compile(
-    rf"^\s*{COMMENT_LEADER}\s*retemplar:begin\s+id=([A-Za-z0-9_.-]+)\s+mode=ignore\s*$",
+    rf"^\s*{COMMENT_LEADER}\s*retemplar:begin\s+id=([A-Za-z0-9_.-]+)\s+mode=(?:ignore|ours)\s*$",
 )
 END_PATTERN = re.compile(
     rf"^\s*{COMMENT_LEADER}\s*retemplar:end\s+id=([A-Za-z0-9_.-]+)\s*$",
